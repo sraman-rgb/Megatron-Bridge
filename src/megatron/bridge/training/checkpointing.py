@@ -619,6 +619,33 @@ def save_checkpoint(
             pg_collection=pg_collection,
         )
 
+    # De-interleave GLU weights/biases if model has interleaved weights in memory
+    # Checkpoints are always saved in contiguous format
+    from megatron.core.utils import get_model_config
+    model_interleave_size = None
+    try:
+        if len(model) > 0:
+            model_config = get_model_config(model[0])
+            model_interleave_size = getattr(model_config, 'moe_mlp_glu_interleave_size', None)
+    except Exception:
+        model_interleave_size = getattr(cfg.model, 'moe_mlp_glu_interleave_size', None)
+    if model_interleave_size is None and os.environ.get("USE_GROUPED_GEMM_FOR_DENSE", "0") == "1":
+        model_interleave_size = 32
+
+    if model_interleave_size is not None:
+        print_rank_0(f'[GLU Interleaving] De-interleaving GLU weights on save: model has interleaved weights (size={model_interleave_size}), converting to contiguous format for checkpoint')
+        if len(model) == 1:
+            state_dict["model"] = _process_state_dict_for_glu_interleaving(
+                state_dict["model"], model_interleave_size, interleave=False
+            )
+        else:
+            for i in range(len(model)):
+                model_key = "model%d" % i
+                if model_key in state_dict:
+                    state_dict[model_key] = _process_state_dict_for_glu_interleaving(
+                        state_dict[model_key], model_interleave_size, interleave=False
+                    )
+
     # Apply PEFT filtering to save adapter-only checkpoints
     if cfg.peft is not None:
         state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, cfg.peft)
@@ -710,6 +737,11 @@ def save_checkpoint(
                     "The 'nvidia_resiliency_ext' module is required for local "
                     "checkpointing but was not found. Please ensure it is installed."
                 )
+            # Embed TrainState so consumed_train_samples and other counters
+            # survive a local-checkpoint resume.  Goes into the ``common``
+            # part of MCoreTensorAwareStateDict (replicated, atomic).
+            state_dict["train_state_metadata"] = train_state.state_dict()
+
             algo = ckpt_cfg.non_persistent_local_ckpt_algo
             cached_metadata = None
             if ckpt_cfg.ckpt_assume_constant_structure and "local_checkpoint_cache" in checkpointing_context:
@@ -810,8 +842,8 @@ def save_checkpoint(
     else:
         _post_save_global_barrier()
 
-    # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
+    # Additional callback for wandb/mlflow (last rank, global checkpoints only)
+    if ckpt_type != CheckpointType.LOCAL and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def wandb_finalize_fn() -> None:
             wandb_utils.on_save_checkpoint_success(
@@ -847,7 +879,8 @@ def save_checkpoint(
     fault_tolerance.on_checkpointing_end(global_state=state, is_async_finalization=False)
 
     # keep only last k checkpoints
-    if ckpt_cfg.most_recent_k > -1:
+    # Skip for LOCAL checkpoints — LocalCheckpointManager manages its own cleanup.
+    if ckpt_cfg.most_recent_k > -1 and ckpt_type != CheckpointType.LOCAL:
         cleanup_old_non_persistent_checkpoint(
             save_dir, leave_ckpt_num=ckpt_cfg.most_recent_k, do_async=ckpt_cfg.async_save
         )
@@ -1358,6 +1391,152 @@ def load_checkpoint(
     )
 
 
+def _deinterleave_glu_weight(weight: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """
+    De-interleave GLU weight from block-interleaved format to contiguous format.
+    
+    Interleaved format (dim=0): [W0:31, V0:31, W32:63, V32:63, ...]
+    Output format: [W_all, V_all]
+    """
+    shape = weight.shape
+    weight = weight.reshape(
+        shape[0] // (2 * interleave_size),  # num_blocks
+        2,                                   # W and V interleaved
+        interleave_size,                     # block size
+        *shape[1:]                           # remaining dimensions
+    )
+    weight = weight.transpose(0, 1).contiguous()
+    weight = weight.reshape(shape)
+    return weight
+
+
+def _deinterleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """
+    De-interleave GLU bias from block-interleaved format to contiguous format.
+    
+    Interleaved format: [W0:31, V0:31, W32:63, V32:63, ...]
+    Output format: [W_all, V_all]
+    """
+    shape = bias.shape
+    bias = bias.reshape(
+        shape[0] // (2 * interleave_size),  # num_blocks
+        2,                                   # W and V interleaved
+        interleave_size                      # block size
+    )
+    bias = bias.transpose(0, 1).contiguous()
+    bias = bias.reshape(shape)
+    return bias
+
+
+def _interleave_glu_weight(weight: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """
+    Interleave GLU weight from concatenated format to block-interleaved format.
+    
+    Input format: [W_all, V_all] (concatenated along dim -2 or dim 0)
+    Output format (dim 0): [W0:31, V0:31, W32:63, V32:63, ...]
+    """
+    shape = weight.shape
+    dim_to_interleave = shape[0]  # First dimension is the output dimension
+    
+    weight = weight.reshape(
+        2,                                        # W and V
+        dim_to_interleave // (2 * interleave_size),  # num_blocks
+        interleave_size,                          # block size
+        *shape[1:]                                # remaining dimensions
+    )
+    weight = weight.transpose(0, 1).contiguous()
+    weight = weight.reshape(shape)
+    return weight
+
+
+def _interleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """
+    Interleave GLU bias from concatenated format to block-interleaved format.
+    
+    Input format: [W_all, V_all] (concatenated)
+    Output format: [W0:31, V0:31, W32:63, V32:63, ...]
+    """
+    shape = bias.shape
+    dim_to_interleave = shape[-1]  # Last dimension for bias
+    
+    bias = bias.reshape(
+        *shape[:-1],
+        2,                                        # W and V
+        dim_to_interleave // (2 * interleave_size),  # num_blocks
+        interleave_size                           # block size
+    )
+    bias = bias.transpose(-3, -2).contiguous()
+    bias = bias.reshape(shape)
+    return bias
+
+
+def _process_state_dict_for_glu_interleaving(
+    model_state_dict: dict[str, Any],
+    interleave_size: int,
+    interleave: bool = True,
+) -> dict[str, Any]:
+    """Process GLU weights and biases in state dict for interleaving or de-interleaving.
+    
+    Args:
+        model_state_dict: The state dict to process
+        interleave_size: The interleave size to use
+        interleave: If True, interleave from contiguous to interleaved (for loading).
+                   If False, de-interleave from interleaved to contiguous (for saving).
+    """
+    if not isinstance(model_state_dict, dict):
+        return model_state_dict
+
+    import sys as _sys
+    _sys.stderr.write(f'[GLU Interleaving] _process_state_dict: interleave={interleave}'
+                      f'  interleave_size={interleave_size}  num_keys={len(model_state_dict)}\n')
+    _sys.stderr.flush()
+    processed_state_dict = {}
+    num_keys_processed = 0
+    operation = "interleaved" if interleave else "de-interleaved"
+    for key, value in model_state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            processed_state_dict[key] = value
+            continue
+        
+        # Check if this is a SwiGLU fc1 weight or bias for local experts (MoE)
+        # NOTE: Must match the condition in _zero_out_fc1_w_weights_for_testing
+        is_swiglu_fc1 = (
+            "shared_experts" not in key
+            and "experts" in key
+            and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
+        )
+        # Check if this is a SwiGLU fc1 weight or bias for dense MLP (num_groups=1)
+        # Only applies when USE_GROUPED_GEMM_FOR_DENSE is set (TEFusedDenseMLP path).
+        is_swiglu_fc1_dense = (
+            os.environ.get("USE_GROUPED_GEMM_FOR_DENSE", "0") == "1"
+            and "experts" not in key
+            and "mlp" in key
+            and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
+        )
+        if is_swiglu_fc1 or is_swiglu_fc1_dense:
+            if "linear_fc1.weight" in key:
+                if interleave:
+                    processed_state_dict[key] = _interleave_glu_weight(value, interleave_size)
+                else:
+                    processed_state_dict[key] = _deinterleave_glu_weight(value, interleave_size)
+            elif "linear_fc1.bias" in key:
+                if interleave:
+                    processed_state_dict[key] = _interleave_glu_bias(value, interleave_size)
+                else:
+                    processed_state_dict[key] = _deinterleave_glu_bias(value, interleave_size)
+            num_keys_processed += 1
+        else:
+            processed_state_dict[key] = value
+    
+    import sys as _sys
+    _sys.stderr.write(f'[GLU Interleaving] _process_state_dict done: processed {num_keys_processed} keys\n')
+    _sys.stderr.flush()
+    if num_keys_processed > 0:
+        print_rank_0(f'[GLU Interleaving] Processed {num_keys_processed} SwiGLU fc1 keys (weights and biases): {operation} with interleave_size={interleave_size}')
+    
+    return processed_state_dict
+
+
 def _load_model_state_dict(module: torch.nn.Module, state_dict: dict[str, Any], strict: bool):
     """Helper function to load state dict with fallback for missing extra states."""
     try:
@@ -1365,9 +1544,13 @@ def _load_model_state_dict(module: torch.nn.Module, state_dict: dict[str, Any], 
     except Exception as e:
         if strict:
             # Fallback support for backward compatibility breaking changes in TransformerEngine
-            print_rank_0(f"Warning: Exception during strict loading: {e}")
             load_return = module.load_state_dict(state_dict, strict=False)
-            print_rank_0(f"load_return: {load_return}")
+            missing = load_return.missing_keys
+            unexpected = load_return.unexpected_keys
+            non_extra = [k for k in missing + unexpected if not k.endswith("._extra_state")]
+            if non_extra:
+                print_rank_0(f"Warning: Exception during strict loading: {e}")
+                print_rank_0(f"Non-extra-state mismatched keys: {non_extra}")
         else:
             # Re-raise if we were already in non-strict mode
             raise
@@ -1404,6 +1587,9 @@ def _load_checkpoint_from_path(
         - iteration: The training iteration number.
         - num_floating_point_operations_so_far: The total FLOPs computed so far.
     """
+    import sys as _sys
+    _sys.stderr.write(f'[GLU DEBUG] _load_checkpoint_from_path ENTERED  load_dir={load_dir}  skip={skip_load_to_model_and_opt}\n')
+    _sys.stderr.flush()
     cfg = state.cfg
     model = unwrap_model(model)
     pg_collection = get_pg_collection(model)
@@ -1425,19 +1611,40 @@ def _load_checkpoint_from_path(
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
+    run_config = None  # Initialize for later use
 
     # Step 3: Format-specific preparation
     if ckpt_format == "torch_dist":
         if state_dict is None:
             return 0, 0
 
-        # Read run_config for TP/PP compatibility checks
-        run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
-        if file_exists(run_config_filename):
-            run_config = read_run_config(run_config_filename)
+        if ckpt_type == CheckpointType.LOCAL:
+            # Local checkpoints don't contain run_config.yaml and checkpoint_name
+            # is a CkptID tuple, not a string path.  Use current config — local
+            # checkpoints always resume with the same parallelism.
+            run_config = {
+                "model": {
+                    "tensor_model_parallel_size": cfg.model.tensor_model_parallel_size,
+                    "pipeline_model_parallel_size": cfg.model.pipeline_model_parallel_size,
+                    "encoder_tensor_model_parallel_size": getattr(cfg.model, "encoder_tensor_model_parallel_size", 0),
+                    "encoder_pipeline_model_parallel_size": getattr(
+                        cfg.model, "encoder_pipeline_model_parallel_size", 0
+                    ),
+                },
+                "checkpoint": {
+                    "save_optim": cfg.checkpoint.save_optim,
+                    "save_rng": cfg.checkpoint.save_rng,
+                    "fully_parallel_save": cfg.checkpoint.fully_parallel_save,
+                },
+            }
         else:
-            print_rank_0("run_config.yaml not found, extracting config from legacy Megatron-LM checkpoint")
-            run_config = _extract_megatron_lm_args_from_state_dict(state_dict)
+            # Read run_config for TP/PP compatibility checks
+            run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+            if file_exists(run_config_filename):
+                run_config = read_run_config(run_config_filename)
+            else:
+                print_rank_0("run_config.yaml not found, extracting config from legacy Megatron-LM checkpoint")
+                run_config = _extract_megatron_lm_args_from_state_dict(state_dict)
 
         ckpt_tp_pp = (
             run_config["model"]["tensor_model_parallel_size"],
@@ -1466,7 +1673,13 @@ def _load_checkpoint_from_path(
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
 
-        sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
+        if ckpt_type == CheckpointType.LOCAL:
+            # Local checkpoints don't store content metadata in common.pt.
+            sharded_sd_metadata = _build_sharded_state_dict_metadata(
+                cfg.optimizer.use_distributed_optimizer, cfg.checkpoint
+            )
+        else:
+            sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f"sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}")
 
         # Determine if optimizer state will be loaded
@@ -1645,21 +1858,95 @@ def _load_checkpoint_from_path(
 
     # Handle train state
     if not cfg.checkpoint.finetune:
-        train_state_filename = get_checkpoint_train_state_filename(checkpoint_name)
-        if file_exists(train_state_filename):
-            state.train_state = read_train_state(train_state_filename)
+        if ckpt_type == CheckpointType.LOCAL:
+            # Local checkpoints embed train_state_metadata in the state dict.
+            if "train_state_metadata" in state_dict:
+                print_rank_0("Restoring TrainState from local checkpoint (train_state_metadata)")
+                state.train_state = TrainState()
+                state.train_state.load_state_dict(state_dict["train_state_metadata"])
+            else:
+                print_rank_0("WARNING: train_state_metadata not found in local checkpoint, counters reset")
+                state.train_state = TrainState(step=state_dict.get("iteration", 0))
         else:
-            print_rank_0(f"{train_state_filename} not found, creating TrainState from checkpoint state dict")
-            state.train_state = _get_train_state_from_state_dict(state_dict)
+            train_state_filename = get_checkpoint_train_state_filename(checkpoint_name)
+            if file_exists(train_state_filename):
+                state.train_state = read_train_state(train_state_filename)
+            else:
+                print_rank_0(f"{train_state_filename} not found, creating TrainState from checkpoint state dict")
+                state.train_state = _get_train_state_from_state_dict(state_dict)
 
     if cfg.checkpoint.finetune or release:
         state.train_state.step = 0
+
+    # For local checkpoints, checkpoint_name is a CkptID tuple.
+    # Normalize to string for downstream logging / wandb / mlflow.
+    if ckpt_type == CheckpointType.LOCAL and not isinstance(checkpoint_name, (str, bytes, os.PathLike)):
+        checkpoint_name = str(checkpoint_name)
 
     if not cfg.checkpoint.finetune:
         update_num_microbatches(consumed_samples=state.train_state.consumed_train_samples, verbose=True)
 
     # Load model weights
     if not skip_load_to_model_and_opt:
+        # Process state dict for GLU interleaving if needed
+        # Assumption: checkpoints are always in contiguous (non-interleaved) format
+        import sys as _sys
+        _sys.stderr.write('[GLU Interleaving] ENTERED skip_load_to_model_and_opt=False block\n')
+        _sys.stderr.flush()
+        from megatron.core.utils import get_model_config
+
+        # Check if model expects interleaved weights - get from model config
+        model_interleave_size = None
+        try:
+            if len(model) > 0:
+                model_config = get_model_config(model[0])
+                model_interleave_size = getattr(model_config, 'moe_mlp_glu_interleave_size', None)
+        except Exception:
+            # Fallback to cfg if model config not available
+            model_interleave_size = getattr(cfg.model, 'moe_mlp_glu_interleave_size', None)
+        # Dense MLP path (TEFusedDenseMLP) uses glu_interleave_size=32 when USE_GROUPED_GEMM_FOR_DENSE is set.
+        use_gemm_dense = os.environ.get("USE_GROUPED_GEMM_FOR_DENSE", "0") == "1"
+        if model_interleave_size is None and use_gemm_dense:
+            model_interleave_size = 32
+        model_expects_interleaving = model_interleave_size is not None
+        _sys.stderr.write(f'[GLU Interleaving] load check: USE_GROUPED_GEMM_FOR_DENSE={use_gemm_dense}'
+                          f'  interleave_size={model_interleave_size}'
+                          f'  expects={model_expects_interleaving}\n')
+        _sys.stderr.flush()
+
+        # Interleave if model expects interleaved weights (checkpoints are always contiguous)
+        if model_expects_interleaving:
+            # DEBUG: inspect fc1 weight type/shape BEFORE interleaving
+            import sys as _sys
+            _sd_model = state_dict.get("model", {})
+            _fc1_key = next((k for k in _sd_model if "linear_fc1.weight" in k and "experts" not in k), None)
+            if _fc1_key is not None:
+                _w = _sd_model[_fc1_key]
+                _sys.stderr.write(f'[GLU Interleaving] PRE-interleave: key={_fc1_key}'
+                                  f'  type={type(_w).__name__}  dtype={getattr(_w,"dtype",None)}'
+                                  f'  shape={tuple(_w.shape) if hasattr(_w,"shape") else "?"}\n')
+                _sys.stderr.flush()
+            print_rank_0(f'[GLU Interleaving] Interleaving GLU weights on load: model expects interleaving (size={model_interleave_size}), converting checkpoint from contiguous to interleaved format')
+            if len(model) == 1:
+                state_dict["model"] = _process_state_dict_for_glu_interleaving(
+                    state_dict["model"], model_interleave_size
+                )
+                # DEBUG: verify post-interleave state_dict key/type
+                _sd_model2 = state_dict["model"]
+                if _fc1_key is not None and _fc1_key in _sd_model2:
+                    _w2 = _sd_model2[_fc1_key]
+                    _sys.stderr.write(f'[GLU Interleaving] POST-interleave: key={_fc1_key}'
+                                      f'  type={type(_w2).__name__}  shape={tuple(_w2.shape) if hasattr(_w2,"shape") else "?"}'
+                                      f'  mean={_w2.float().mean().item():.6f}\n')
+                    _sys.stderr.flush()
+            else:
+                for i in range(len(model)):
+                    model_key = "model%d" % i
+                    if model_key in state_dict:
+                        state_dict[model_key] = _process_state_dict_for_glu_interleaving(
+                            state_dict[model_key], model_interleave_size
+                        )
+
         # Handle PEFT resume for strict loading
         load_strict = strict
         is_peft_resume = (
@@ -1672,7 +1959,47 @@ def _load_checkpoint_from_path(
         load_strict = False if is_peft_resume else strict
 
         if len(model) == 1:
+            import sys as _sys
+            # DEBUG: compare model fc1 weight vs state_dict fc1 weight BEFORE load_state_dict
+            _fc1_param = None
+            _fc1_param_name = None
+            for _pname, _p in model[0].named_parameters():
+                if "linear_fc1.weight" in _pname and "experts" not in _pname:
+                    _fc1_param = _p
+                    _fc1_param_name = _pname
+                    break
+            _sd_fc1 = None
+            if model_expects_interleaving:
+                _sd_fc1_key = next((k for k in state_dict.get("model", {}) if "linear_fc1.weight" in k and "experts" not in k), None)
+                if _sd_fc1_key is not None:
+                    _sd_fc1 = state_dict["model"][_sd_fc1_key]
+            if _fc1_param is not None and _sd_fc1 is not None:
+                try:
+                    _p_f = _fc1_param.float()
+                    _s_f = _sd_fc1.float()
+                    # row 0 should be gate[0] in both; row 32 should be gate[32] (non-interleaved) or up[0] (interleaved)
+                    _diff_row32 = (_p_f[32] - _s_f[32]).abs().mean().item()
+                    _match_row0 = (_p_f[0] - _s_f[0]).abs().mean().item()
+                    _sys.stderr.write(f'[GLU Interleaving] BEFORE load_state_dict: model_row0_vs_sd_row0 diff={_match_row0:.6f}'
+                                      f'  model_row32_vs_sd_row32 diff={_diff_row32:.6f}'
+                                      f'  (nonzero row32 diff = load_state_dict will change weights)\n')
+                    _sys.stderr.flush()
+                except Exception as _e:
+                    _sys.stderr.write(f'[GLU Interleaving] BEFORE diff check failed: {_e}\n')
+                    _sys.stderr.flush()
             _load_model_state_dict(model[0], state_dict["model"], load_strict)
+            # DEBUG: model fc1 row 32 AFTER load_state_dict — should now match state_dict row 32
+            if _fc1_param is not None and _sd_fc1 is not None:
+                try:
+                    _p_f2 = _fc1_param.float()
+                    _s_f2 = _sd_fc1.float()
+                    _diff_row32_after = (_p_f2[32] - _s_f2[32]).abs().mean().item()
+                    _sys.stderr.write(f'[GLU Interleaving] AFTER load_state_dict: model_row32_vs_sd_row32 diff={_diff_row32_after:.6f}'
+                                      f'  (should be ~0 if load_state_dict applied interleaved weights)\n')
+                    _sys.stderr.flush()
+                except Exception as _e:
+                    _sys.stderr.write(f'[GLU Interleaving] AFTER diff check failed: {_e}\n')
+                    _sys.stderr.flush()
         else:
             for i in range(len(model)):
                 model_key = "model%d" % i
@@ -1691,7 +2018,12 @@ def _load_checkpoint_from_path(
                 and optimizer is not None
                 and not getattr(optimizer, "is_stub_optimizer", False)
             ):
-                optimizer.load_state_dict(state_dict["optimizer"])
+                # torch.no_grad() is needed for local checkpoints: the
+                # DistributedOptimizer copies loaded tensors into main
+                # params via .copy_(), which fails on leaf Variables that
+                # require grad without this context.
+                with torch.no_grad():
+                    optimizer.load_state_dict(state_dict["optimizer"])
 
             if opt_param_scheduler is not None:
                 if "lr_scheduler" in state_dict:
@@ -2060,6 +2392,12 @@ def _load_non_persistent_base_checkpoint(
             pg_collection=pg_collection,
         )
     elif ckpt_cfg.non_persistent_ckpt_type == "local":
+        if rank0:
+            # The rank0 pass only needs metadata to make loading decisions
+            # (TP/PP checks, optimizer sharding type, etc.).
+            # For local checkpoints all of that is derived from the running config,
+            # so skip the expensive full load + to_state_dict conversion.
+            return {}, non_persistent_iteration, False, CheckpointType.LOCAL
         intermediate_state_dict, checkpoint_name = checkpointing_context["local_checkpoint_manager"].load()
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
