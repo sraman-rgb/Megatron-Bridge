@@ -1562,6 +1562,12 @@ class ConfigContainer(Container):
                 self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
             if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag:
                 self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+            # reuse_grad_buf_for_high_precision_param_ag is not supported with Megatron FSDP
+            if self.ddp.reuse_grad_buf_for_high_precision_param_ag:
+                print_rank_0("reuse_grad_buf_for_high_precision_param_ag is not supported with Megatron FSDP, setting to False")
+                self.ddp.reuse_grad_buf_for_high_precision_param_ag = False
+            if self.optimizer.reuse_grad_buf_for_high_precision_param_ag:
+                self.optimizer.reuse_grad_buf_for_high_precision_param_ag = False
 
         # ModelOpt/Quantization checks
         if getattr(self.model, "restore_modelopt_state", False):

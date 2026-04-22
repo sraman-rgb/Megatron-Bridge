@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from dataclasses import dataclass, fields
 from typing import Callable, Optional
 
@@ -66,6 +67,8 @@ class MixedPrecisionConfig:
     num_layers_at_start_in_bf16: int = 0
     num_layers_at_end_in_bf16: int = 0
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    reuse_grad_buf_for_high_precision_param_ag: bool = False
+    fp4_param: bool = False
 
     def __setattr__(self, name: str, value) -> None:
         # Use object.__setattr__ to avoid recursion
@@ -80,6 +83,16 @@ class MixedPrecisionConfig:
                 object.__setattr__(self, "fp8_param_gather", value)
 
     def finalize(self):
+        # Allow env vars to override fp4_param and reuse_grad_buf_for_high_precision_param_ag.
+        # NVFP4_PARAM=1 enables keeping weights as NVFP4Tensor + post-AllGather quantization via
+        # the distributed optimizer, avoiding per-forward re-quantization.
+        # If fp4 is not already set (e.g. activated via a separate mechanism like FP4_RECIPE env var),
+        # it is also set to "e2m1" here so that TransformerConfig validation passes.
+        if os.getenv("NVFP4_PARAM", "0") == "1":
+            self.fp4_param = True
+            self.reuse_grad_buf_for_high_precision_param_ag = True
+            logging.info("NVFP4_PARAM=1: enabling fp4_param=True, reuse_grad_buf_for_high_precision_param_ag=True")
+
         # If fp8_param is None, initialize it from fp8_param_gather
         if self.fp8_param is None:
             self.fp8_param = self.fp8_param_gather
@@ -89,6 +102,12 @@ class MixedPrecisionConfig:
             assert self.reuse_grad_buf_for_mxfp8_param_ag, (
                 "When fp8_param_gather=True and fp8_recipe='mxfp8', "
                 "reuse_grad_buf_for_mxfp8_param_ag must be set to True"
+            )
+        # Validate that nvfp4 recipe requires reuse_grad_buf_for_high_precision_param_ag=True when fp4_param=True
+        if self.fp4_param and self.fp4_recipe == "nvfp4":
+            assert self.reuse_grad_buf_for_high_precision_param_ag, (
+                "When fp4_param=True and fp4_recipe='nvfp4', "
+                "reuse_grad_buf_for_high_precision_param_ag must be set to True"
             )
         # FP4 and FP8 are mutually exclusive
         if self.fp4 and self.fp8:
@@ -399,7 +418,8 @@ def bf16_with_nvfp4_mixed() -> MixedPrecisionConfig:
     cfg.fp8 = None
     cfg.fp4 = "e2m1"
     cfg.fp4_recipe = "nvfp4"
-    cfg.fp8_param_gather = False
+    cfg.fp4_param = True
+    cfg.reuse_grad_buf_for_high_precision_param_ag = True
     return cfg
 
 

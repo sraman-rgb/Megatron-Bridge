@@ -714,6 +714,7 @@ def train_step(
             model=model,
             reuse_grad_buf_for_mxfp8_param_ag=cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
             overlap_param_gather=cfg.ddp.overlap_param_gather,
+            reuse_grad_buf_for_high_precision_param_ag=cfg.optimizer.reuse_grad_buf_for_high_precision_param_ag,
         )
 
         # Handle finetuning vs pretraining data consumption
@@ -1383,10 +1384,11 @@ def _handle_mxfp8_param_buffer_copy(
     model: list[MegatronModule],
     reuse_grad_buf_for_mxfp8_param_ag: bool,
     overlap_param_gather: bool,
+    reuse_grad_buf_for_high_precision_param_ag: bool = False,
 ) -> None:
-    """Copy main params to param buffer for mxfp8 with grad buffer reuse.
+    """Copy main params to param buffer for mxfp8/nvfp4 with grad buffer reuse.
 
-    For mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+    For params with reuse_grad_buf_for_{mxfp8,nvfp4}_param_ag and dp_ag_overlap,
     we need to call _copy_main_params_to_param_buffer() after the grad buffer
     is zeroed because param and grad buffer are shared.
 
@@ -1399,10 +1401,11 @@ def _handle_mxfp8_param_buffer_copy(
     Args:
         optimizer: The MegatronOptimizer instance
         model: List of model chunks (MegatronModule instances)
-        reuse_grad_buf_for_mxfp8_param_ag: Config flag for grad buffer reuse
+        reuse_grad_buf_for_mxfp8_param_ag: Config flag for grad buffer reuse (MXFP8)
         overlap_param_gather: Config flag for overlapping param gathering
+        reuse_grad_buf_for_high_precision_param_ag: Config flag for grad buffer reuse (NVFP4)
     """
-    if reuse_grad_buf_for_mxfp8_param_ag and overlap_param_gather:
+    if (reuse_grad_buf_for_mxfp8_param_ag or reuse_grad_buf_for_high_precision_param_ag) and overlap_param_gather:
         # Check if forward_pre_hook is enabled by checking if hooks are registered.
         forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
         if forward_pre_hook_enabled:
