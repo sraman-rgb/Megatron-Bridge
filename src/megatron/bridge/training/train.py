@@ -93,6 +93,7 @@ from megatron.bridge.training.utils.log_utils import append_to_progress_log, bar
 from megatron.bridge.training.utils.train_utils import (
     calc_params_l2_norm,
     logical_and_across_model_parallel_group,
+    maybe_print_cuda_memory_trace,
     prepare_forward_step_func,
     reduce_max_stat_across_model_parallel_group,
     training_log,
@@ -466,6 +467,12 @@ def train(
             forward_backward_func,
             p2p_communicator,
         )
+        if global_state.train_state.step <= start_iteration + 1:
+            maybe_print_cuda_memory_trace(
+                "after_train_step",
+                config,
+                detail=f"iteration={global_state.train_state.step} skipped_iter={skipped_iter}",
+            )
 
         fault_tolerance.on_training_step_end(global_state)
 
@@ -607,6 +614,12 @@ def train(
                 energy_monitor.pause()
             timers("interval-time").stop()
             if should_toggle_forward_pre_hook:
+                _handle_nvfp4_reuse_param_buffer_copy(
+                    optimizer=optimizer,
+                    model=model,
+                    reuse_grad_buf_for_nvfp4_param_ag=config.optimizer.reuse_grad_buf_for_nvfp4_param_ag,
+                    overlap_param_gather=config.ddp.overlap_param_gather,
+                )
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
             if train_config.manual_gc and train_config.manual_gc_eval:
@@ -626,6 +639,7 @@ def train(
                 process_non_loss_data_func=process_non_loss_data_func,
                 non_loss_data_func=non_loss_data_func,
                 callback_manager=callback_manager,
+                optimizer=optimizer,
             )
             timers("eval-time").stop()
 
@@ -654,6 +668,8 @@ def train(
             config.train.check_weight_hash_across_dp_replicas_interval,
             global_state.train_state.step,
             should_toggle_forward_pre_hook,
+            optimizer=optimizer,
+            cfg=config,
         )
         handle_profiling_stop(
             config.profiling,
@@ -714,6 +730,12 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
+        _handle_nvfp4_reuse_param_buffer_copy(
+            optimizer=optimizer,
+            model=model,
+            reuse_grad_buf_for_nvfp4_param_ag=config.optimizer.reuse_grad_buf_for_nvfp4_param_ag,
+            overlap_param_gather=config.ddp.overlap_param_gather,
+        )
         disable_forward_pre_hook(model)
 
     # This will finalize all unfinalized async request and terminate
@@ -813,6 +835,12 @@ def train_step(
             reuse_grad_buf_for_mxfp8_param_ag=cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
             overlap_param_gather=cfg.ddp.overlap_param_gather,
         )
+        _handle_nvfp4_reuse_param_buffer_copy(
+            optimizer=optimizer,
+            model=model,
+            reuse_grad_buf_for_nvfp4_param_ag=cfg.optimizer.reuse_grad_buf_for_nvfp4_param_ag,
+            overlap_param_gather=cfg.ddp.overlap_param_gather,
+        )
 
         # Handle finetuning vs pretraining data consumption
         seq_length = getattr(model_config, "seq_length", cfg.model.seq_length)  # Default for pretraining
@@ -873,6 +901,7 @@ def train_step(
         torch.cuda.empty_cache()
 
     # Update parameters.
+    maybe_print_cuda_memory_trace("before_optimizer_step", cfg)
     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -1004,6 +1033,8 @@ def maybe_check_weight_hash_across_dp_replicas(
     check_weight_hash_across_dp_replicas_interval: Optional[int],
     iteration: int,
     should_toggle_forward_pre_hook: bool,
+    optimizer: Optional[MegatronOptimizer] = None,
+    cfg: Optional[ConfigContainer] = None,
 ) -> None:
     """Verifies weight hashes across data-parallel replicas when requested.
 
@@ -1019,6 +1050,13 @@ def maybe_check_weight_hash_across_dp_replicas(
         return
 
     if should_toggle_forward_pre_hook:
+        if optimizer is not None and cfg is not None:
+            _handle_nvfp4_reuse_param_buffer_copy(
+                optimizer=optimizer,
+                model=model,
+                reuse_grad_buf_for_nvfp4_param_ag=cfg.optimizer.reuse_grad_buf_for_nvfp4_param_ag,
+                overlap_param_gather=cfg.ddp.overlap_param_gather,
+            )
         disable_forward_pre_hook(model)
     assert check_param_hashes_across_dp_replicas(model, cross_check=True), (
         "Parameter hashes not matching across DP replicas"
@@ -1245,6 +1283,12 @@ def save_checkpoint_and_time(
         state.cfg.ddp.overlap_param_gather,
     )
     if should_force_param_sync:
+        _handle_nvfp4_reuse_param_buffer_copy(
+            optimizer=optimizer,
+            model=model,
+            reuse_grad_buf_for_nvfp4_param_ag=state.cfg.optimizer.reuse_grad_buf_for_nvfp4_param_ag,
+            overlap_param_gather=state.cfg.ddp.overlap_param_gather,
+        )
         force_param_sync(model)
 
     # Free overlap param-gather buffers and release cached GPU memory so
@@ -1573,6 +1617,22 @@ def _handle_mxfp8_param_buffer_copy(
             for optim_instance in optimizer.chained_optimizers:
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
+
+
+def _handle_nvfp4_reuse_param_buffer_copy(
+    optimizer: MegatronOptimizer,
+    model: list[MegatronModule],
+    reuse_grad_buf_for_nvfp4_param_ag: bool,
+    overlap_param_gather: bool,
+) -> None:
+    """Populate the NVFP4 reused BF16 param AG view after grad zeroing."""
+    if reuse_grad_buf_for_nvfp4_param_ag and overlap_param_gather:
+        forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+        full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+        if forward_pre_hook_enabled or full_cg_captured:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance._copy_main_params_to_nvfp4_reuse_param_buffer()
 
 
 def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):

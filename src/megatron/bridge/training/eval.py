@@ -64,6 +64,7 @@ def evaluate(
     pg_collection: Optional[Union[ProcessGroupCollection, "MultiModuleProcessGroupCollection"]] = None,
     callback_manager: CallbackManager | None = None,
     is_test: bool = False,
+    optimizer: Optional[Any] = None,
 ) -> tuple[Optional[dict[str, torch.Tensor]], Optional[Any], bool]:
     """Evaluation function.
 
@@ -228,6 +229,7 @@ def evaluate(
                     ),
                 )
 
+            _prepare_nvfp4_reuse_param_buffer_for_eval(state, model, optimizer)
             loss_dicts = forward_backward_func(
                 forward_step_func=wrapped_forward_step,
                 data_iterator=eval_data_iterator,
@@ -336,6 +338,7 @@ def evaluate(
             if non_loss_p2p_communicator is None:
                 non_loss_p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
 
+            _prepare_nvfp4_reuse_param_buffer_for_eval(state, model, optimizer)
             collected_non_loss_data = forward_backward_func(
                 forward_step_func=wrapped_forward_step,
                 data_iterator=non_loss_data_iterator,
@@ -365,6 +368,26 @@ def evaluate(
     return total_loss_dict, collected_non_loss_data, False
 
 
+def _prepare_nvfp4_reuse_param_buffer_for_eval(
+    state: GlobalState,
+    model: list[MegatronModule],
+    optimizer: Optional[Any],
+) -> None:
+    """Populate the NVFP4 reused BF16 AG source before eval param gather."""
+    if optimizer is None:
+        return
+    if not (
+        state.cfg.optimizer.reuse_grad_buf_for_nvfp4_param_ag
+        and state.cfg.ddp.overlap_param_gather
+    ):
+        return
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    for optim_instance in getattr(optimizer, "chained_optimizers", [optimizer]):
+        if isinstance(optim_instance, DistributedOptimizer):
+            optim_instance._copy_main_params_to_nvfp4_reuse_param_buffer()
+
+
 def evaluate_and_print_results(
     state: GlobalState,
     prefix: str,
@@ -380,6 +403,7 @@ def evaluate_and_print_results(
     pg_collection: Optional[Union[ProcessGroupCollection, "MultiModuleProcessGroupCollection"]] = None,
     callback_manager: CallbackManager | None = None,
     is_test: bool = False,
+    optimizer: Optional[Any] = None,
 ) -> None:
     """Helper function to evaluate and dump results on screen.
 
@@ -438,6 +462,7 @@ def evaluate_and_print_results(
         pg_collection=pg_collection,
         callback_manager=callback_manager,
         is_test=is_test,
+        optimizer=optimizer,
     )
 
     # Timelimit hit during evaluation

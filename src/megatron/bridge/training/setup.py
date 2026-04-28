@@ -55,6 +55,7 @@ from megatron.bridge.training.tensor_inspect import (
 )
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.log_utils import append_to_progress_log, barrier_and_log, setup_logging
+from megatron.bridge.training.utils.train_utils import maybe_print_cuda_memory_trace
 from megatron.bridge.utils.common_utils import get_rank_safe, print_rank_0
 
 class SetupOutput(NamedTuple):
@@ -229,6 +230,7 @@ def setup(
         _register_pre_wrap_hook(cfg.model, modelopt_pre_wrap_hook)
 
     model = _build_distributed_model(cfg, pg_collection)
+    maybe_print_cuda_memory_trace("after_ddp_setup", cfg)
 
     cfg.model.timers = timers
     cfg.optimizer.timers = timers
@@ -242,6 +244,7 @@ def setup(
         pg_collection=pg_collection if cfg.dist.use_decentralized_pg else None,
         optimizer_config_override_provider=cfg.optimizer_config_override_provider,
     )
+    maybe_print_cuda_memory_trace("after_optimizer_setup", cfg)
     timers("model-and-optimizer-setup").stop()
     barrier_and_log("after model, optimizer, and learning rate scheduler are built")
 

@@ -75,6 +75,89 @@ MEMORY_KEYS: dict[str, str] = {
     "allocation.all.current": "mem-allocated-count",
 }
 
+_CUDA_MEMORY_TRACE_PRINTS = 0
+
+
+def maybe_print_cuda_memory_trace(
+    event: str, cfg: Optional[ConfigContainer] = None, detail: str = ""
+) -> None:
+    """Print rank-0 CUDA memory stats for baseline/optimized run comparisons."""
+    global _CUDA_MEMORY_TRACE_PRINTS
+
+    max_prints_env = os.getenv(
+        "NVFP4_MEMORY_TRACE_PRINTS", os.getenv("NVFP4_REUSE_GRAD_BUF_TRACE_PRINTS", "0")
+    )
+    try:
+        max_prints = int(max_prints_env)
+    except ValueError:
+        max_prints = 0
+    if max_prints <= 0 or _CUDA_MEMORY_TRACE_PRINTS >= max_prints:
+        return
+
+    rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    if rank != 0 and os.getenv("NVFP4_MEMORY_TRACE_ALL_RANKS", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+
+    _CUDA_MEMORY_TRACE_PRINTS += 1
+    if not torch.cuda.is_available():
+        print(f"[NVFP4_MEMORY_TRACE] rank={rank} event={event} cuda_available=False {detail}", flush=True)
+        return
+
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            print(
+                f"[NVFP4_MEMORY_TRACE] rank={rank} event={event} "
+                f"cuda_memory=skipped_stream_capture {detail}",
+                flush=True,
+            )
+            return
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except RuntimeError as exc:
+        print(
+            f"[NVFP4_MEMORY_TRACE] rank={rank} event={event} "
+            f"cuda_memory_error={type(exc).__name__} {detail}",
+            flush=True,
+        )
+        return
+
+    gib = 1024**3
+    cfg_detail = ""
+    if cfg is not None:
+        cfg_detail = (
+            f" reuse_grad_buf_for_nvfp4_param_ag="
+            f"{getattr(cfg.optimizer, 'reuse_grad_buf_for_nvfp4_param_ag', None)}"
+            f" overlap_param_gather={getattr(cfg.ddp, 'overlap_param_gather', None)}"
+            f" fp4_megatron_weight_quantization="
+            f"{getattr(cfg.model, 'fp4_megatron_weight_quantization', None)}"
+        )
+    env_detail = (
+        f" fp4_shadow={os.getenv('FP4_MEGATRON_WEIGHT_SHADOW', 'unset')}"
+        f" fp4_shadow_use_in_forward="
+        f"{os.getenv('FP4_MEGATRON_WEIGHT_SHADOW_USE_IN_FORWARD', 'unset')}"
+        f" fp4_shadow_skip_param_data_copy="
+        f"{os.getenv('FP4_MEGATRON_WEIGHT_SHADOW_SKIP_PARAM_DATA_COPY', 'unset')}"
+        f" fp4_shadow_drop_persistent_param_data="
+        f"{os.getenv('FP4_MEGATRON_WEIGHT_SHADOW_DROP_PERSISTENT_PARAM_DATA', 'unset')}"
+    )
+    print(
+        f"[NVFP4_MEMORY_TRACE] rank={rank} event={event}"
+        f"{cfg_detail}{env_detail}"
+        f" cuda_allocated_gib={torch.cuda.memory_allocated() / gib:.3f}"
+        f" cuda_max_allocated_gib={torch.cuda.max_memory_allocated() / gib:.3f}"
+        f" cuda_reserved_gib={torch.cuda.memory_reserved() / gib:.3f}"
+        f" cuda_free_gib={free_bytes / gib:.3f}"
+        f" cuda_total_gib={total_bytes / gib:.3f}"
+        f" {detail}",
+        flush=True,
+    )
+
 
 def param_is_not_shared(param: nn.Parameter) -> bool:
     """Check if a parameter is marked as not shared.
@@ -901,6 +984,15 @@ def report_memory(memory_keys: Optional[dict[str, str]]) -> dict:
                 memory_report[name.replace("bytes", "gigabytes")] = gigabytes
             else:
                 memory_report[name] = memory_stats[torch_name]
+
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        gib = 1024**3
+        memory_report["cuda_free_gibibytes"] = free_bytes / gib
+        memory_report["cuda_total_gibibytes"] = total_bytes / gib
+        memory_report["cuda_allocated_gibibytes"] = torch.cuda.memory_allocated() / gib
+        memory_report["cuda_max_allocated_gibibytes"] = torch.cuda.max_memory_allocated() / gib
+        memory_report["cuda_reserved_gibibytes"] = torch.cuda.memory_reserved() / gib
 
     return memory_report
 

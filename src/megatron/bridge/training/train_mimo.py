@@ -404,6 +404,7 @@ def train_mimo(
                 write_to_tensorboard=True,
                 p2p_communicator=multimodule_communicator,
                 pg_collection=multimodule_pg_collection,
+                optimizer=optimizer,
             )
             timers("evaluate").stop()
 

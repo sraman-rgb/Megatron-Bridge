@@ -172,6 +172,7 @@ def _pretrain(
             verbose=True,
             write_to_tensorboard=not config.validation.skip_train,
             callback_manager=callback_manager,
+            optimizer=optimizer,
         )
     if state.train_state.do_test:
         prefix = f"iteration {iteration} on test set"
@@ -186,6 +187,7 @@ def _pretrain(
             write_to_tensorboard=not config.validation.skip_train,
             callback_manager=callback_manager,
             is_test=True,
+            optimizer=optimizer,
         )
 
     _finish_train(state, checkpoint_manager)

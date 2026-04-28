@@ -64,6 +64,7 @@ class MixedPrecisionConfig:
     fp4_recipe: str = "nvfp4"
     fp4_param: Optional[bool] = None
     fp4_param_gather: bool = False
+    fp4_megatron_weight_quantization: bool = False
     # FP16 Loss scaling
     loss_scale: Optional[float] = None
     initial_loss_scale: Optional[float] = 4294967296  # 2**32
@@ -73,6 +74,7 @@ class MixedPrecisionConfig:
     num_layers_at_start_in_bf16: int = 0
     num_layers_at_end_in_bf16: int = 0
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    reuse_grad_buf_for_nvfp4_param_ag: bool = False
 
     def __setattr__(self, name: str, value) -> None:
         # Use object.__setattr__ to avoid recursion
@@ -115,6 +117,22 @@ class MixedPrecisionConfig:
 
         if self.fp4 and not is_te_min_version("2.7.0.dev0"):
             raise ValueError("fp4 requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
+        if self.fp4_megatron_weight_quantization and not self.fp4:
+            raise ValueError("fp4_megatron_weight_quantization requires fp4 to be enabled.")
+        if self.fp4_megatron_weight_quantization and self.fp4_param_gather:
+            raise ValueError(
+                "fp4_megatron_weight_quantization expects BF16 params and is incompatible "
+                "with fp4_param_gather."
+            )
+        if self.reuse_grad_buf_for_nvfp4_param_ag and not self.fp4:
+            raise ValueError(
+                "reuse_grad_buf_for_nvfp4_param_ag requires fp4 to be enabled."
+            )
+        if self.reuse_grad_buf_for_nvfp4_param_ag and self.fp4_param_gather:
+            raise ValueError(
+                "reuse_grad_buf_for_nvfp4_param_ag validates BF16 param all-gather and "
+                "is incompatible with fp4_param_gather."
+            )
 
     def setup(
         self,
