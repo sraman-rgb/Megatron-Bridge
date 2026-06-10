@@ -123,6 +123,16 @@ def test_each_deepseek_recipe_builds_config(recipe_func: Callable, monkeypatch: 
     assert getattr(cfg.model, "pipeline_model_parallel_size", 1) >= 1
 
 
+@pytest.mark.parametrize("recipe_name", ["deepseek_v3_pretrain_config", "deepseek_v3_pretrain_config_32nodes"])
+def test_deepseek_v3_recipes_enable_mla_down_proj_fusion(recipe_name: str, monkeypatch: pytest.MonkeyPatch):
+    mod = importlib.import_module("megatron.bridge.recipes.deepseek.deepseek_v3")
+    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+
+    cfg = getattr(mod, recipe_name)()
+
+    assert cfg.model.mla_down_proj_fusion is True
+
+
 def test_deepseek_v3_pipeline_layout_can_place_mtp_in_standalone_stage():
     model_cfg = _FakeModelCfg()
     model_cfg.num_layers = 61

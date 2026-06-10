@@ -158,6 +158,7 @@ def deepseek_v3_pretrain_config() -> ConfigContainer:
 
     # TE (Transformer Engine)
     cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.mla_down_proj_fusion = True
 
     # CUDA Graph
     cfg.model.cuda_graph_impl = "none"
@@ -314,6 +315,7 @@ def deepseek_v3_pretrain_config_32nodes() -> ConfigContainer:
 
     # TE (Transformer Engine)
     cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.mla_down_proj_fusion = True
 
     # CUDA Graph
     cfg.model.cuda_graph_impl = "none"
